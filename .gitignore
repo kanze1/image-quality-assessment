@@ -46,8 +46,8 @@ data/*.h5
 data/*.hdf5
 
 # Image folders (if too large)
-# All/
-# RAW/
+All/
+RAW/
 
 # Excel files (optional, uncomment if you don't want to track)
 # *.xlsx
