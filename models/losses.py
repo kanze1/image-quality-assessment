@@ -1,261 +1,185 @@
 """
-多任务损失函数 - MSE + Ranking + Contrastive
+端到端多任务损失函数 - 质量 + ID 一致性
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 
-class RankingLoss(nn.Module):
+@dataclass
+class LossConfig:
+    # 回归权重
+    w_q: float = 1.0
+    w_id: float = 1.0
+    # PLCC 权重（趋势相关性）
+    lambda_plcc: float = 0.1
+    # SupCon 权重（同 raw_id）
+    lambda_sup: float = 0.05
+    # ranking 权重（ID 排序）
+    lambda_rank: float = 0.05
+    # SupCon 温度
+    supcon_temperature: float = 0.1
+    # ranking margin
+    rank_margin: float = 0.1
+
+
+class IQALoss(nn.Module):
     """
-    Ranking Loss - 保持分数的相对顺序
-    对于分数对 (s1, s2)，如果 s1 > s2，则预测也应该 p1 > p2
-    """
-    def __init__(self, margin=0.5):
-        super(RankingLoss, self).__init__()
-        self.margin = margin
+    适用于：一次输出两个分数（质量 + ID 一致性）的端到端模型。
     
-    def forward(self, predictions, targets):
-        # 创建所有可能的配对
-        batch_size = predictions.size(0)
-        
-        # 扩展维度用于配对比较
-        pred_i = predictions.unsqueeze(1)  # (batch, 1)
-        pred_j = predictions.unsqueeze(0)  # (1, batch)
-        target_i = targets.unsqueeze(1)
-        target_j = targets.unsqueeze(0)
-        
-        # 计算分数差异
-        pred_diff = pred_i - pred_j  # (batch, batch)
-        target_diff = target_i - target_j
-        
-        # 只考虑目标分数有明显差异的配对（避免噪声）
-        valid_pairs = torch.abs(target_diff) > 0.5
-        
-        # Ranking loss: 如果 target_i > target_j，则希望 pred_i > pred_j
-        # 使用 hinge loss
-        loss = torch.clamp(self.margin - torch.sign(target_diff) * pred_diff, min=0)
-        
-        # 只计算有效配对的损失
-        loss = loss * valid_pairs.float()
-        
-        # 平均损失
-        num_valid = valid_pairs.sum() + 1e-8
-        return loss.sum() / num_valid
-
-
-class RawIDContrastiveLoss(nn.Module):
+    输入：
+        q_pred:  [B] 或 [B, 1]
+        id_pred: [B] 或 [B, 1]
+        q_gt:    [B]
+        id_gt:   [B]
+        feats:   [B, D] 中间特征
+        raw_ids: [B] int，同一 raw_id 表示来自同一原始人脸
     """
-    基于RAW ID的对比学习损失 - 标准InfoNCE loss
+    def __init__(self, config: LossConfig = LossConfig()):
+        super().__init__()
+        self.cfg = config
+        self.huber = nn.SmoothL1Loss(reduction='mean')  # Huber loss
     
-    核心思想：
-    - 同一个原始图像的8张生成图像 = 正样本（应该相似）
-    - 不同原始图像的生成图像 = 负样本（应该不同）
-    """
-    def __init__(self, temperature=0.07):
-        super(RawIDContrastiveLoss, self).__init__()
-        self.temperature = temperature
-    
-    def forward(self, embeddings, raw_ids):
-        """
-        Args:
-            embeddings: (batch_size, embedding_dim) - L2归一化的embedding
-            raw_ids: (batch_size,) - 对应的原始图像ID
+    def forward(self,
+                q_pred: torch.Tensor,
+                id_pred: torch.Tensor,
+                q_gt: torch.Tensor,
+                id_gt: torch.Tensor,
+                feats: torch.Tensor,
+                raw_ids: torch.Tensor):
+        # 保证形状一致：[B]
+        q_pred = q_pred.view(-1)
+        id_pred = id_pred.view(-1)
+        q_gt = q_gt.view(-1)
+        id_gt = id_gt.view(-1)
+        raw_ids = raw_ids.view(-1)
         
-        Returns:
-            InfoNCE loss
-        """
-        batch_size = embeddings.size(0)
-        device = embeddings.device
+        # ===== 1. 回归损失（质量 + ID） =====
+        loss_q = self.huber(q_pred, q_gt)
+        loss_id = self.huber(id_pred, id_gt)
+        loss_reg = self.cfg.w_q * loss_q + self.cfg.w_id * loss_id
         
-        # 计算embedding之间的相似度矩阵
-        # sim_matrix[i,j] = embeddings[i] · embeddings[j] / temperature
-        sim_matrix = torch.matmul(embeddings, embeddings.t()) / self.temperature  # (batch, batch)
+        # ===== 2. PLCC 损失（趋势相关性） =====
+        loss_plcc_q = self.plcc_loss(q_pred, q_gt)
+        loss_plcc_id = self.plcc_loss(id_pred, id_gt)
+        loss_plcc = loss_plcc_q + loss_plcc_id
+        loss_plcc = self.cfg.lambda_plcc * loss_plcc
         
-        # 构建正样本mask：raw_ids相同的为正样本
-        raw_ids = raw_ids.unsqueeze(1)  # (batch, 1)
-        positive_mask = (raw_ids == raw_ids.t()).float()  # (batch, batch)
+        # ===== 3. SupCon 损失（同 raw_id 为正样本） =====
+        loss_sup = self.supcon_loss(feats, raw_ids)
+        loss_sup = self.cfg.lambda_sup * loss_sup
         
-        # 排除自己（对角线）
-        self_mask = torch.eye(batch_size, device=device).bool()
-        positive_mask = positive_mask.masked_fill(self_mask, 0)
+        # ===== 4. ID 排序损失（同 raw 内高分 > 低分） =====
+        loss_rank_id = self.id_ranking_loss(id_pred, id_gt, raw_ids)
+        loss_rank_id = self.cfg.lambda_rank * loss_rank_id
         
-        # 负样本mask：raw_ids不同的为负样本
-        negative_mask = (raw_ids != raw_ids.t()).float()
+        # ===== 5. 总损失 =====
+        loss_total = loss_reg + loss_plcc + loss_sup + loss_rank_id
         
-        # 计算InfoNCE loss
-        # 对于每个anchor，计算与所有正样本的相似度 vs 所有负样本的相似度
-        
-        # 数值稳定性：减去最大值
-        sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
-        
-        # 分子：正样本的相似度之和
-        pos_sim = (sim_matrix_exp * positive_mask).sum(dim=1)  # (batch,)
-        
-        # 分母：所有样本（正样本+负样本）的相似度之和
-        all_sim = (sim_matrix_exp * (positive_mask + negative_mask)).sum(dim=1)  # (batch,)
-        
-        # InfoNCE loss: -log(正样本相似度 / 所有相似度)
-        # 只计算有正样本的anchor
-        has_positive = (positive_mask.sum(dim=1) > 0)
-        
-        if has_positive.sum() > 0:
-            loss = -torch.log(pos_sim[has_positive] / (all_sim[has_positive] + 1e-8))
-            return loss.mean()
-        else:
-            # 如果batch中没有正样本对，返回0
-            return torch.tensor(0.0, device=device)
-
-
-class HybridContrastiveLoss(nn.Module):
-    """
-    混合对比学习损失：结合RAW ID和分数相似度
-    
-    - RAW ID定义硬正负样本（同一原始图像 vs 不同原始图像）
-    - 分数相似度定义软权重（分数接近的样本更重要）
-    """
-    def __init__(self, temperature=0.07, score_weight=0.3):
-        super(HybridContrastiveLoss, self).__init__()
-        self.temperature = temperature
-        self.score_weight = score_weight  # 分数相似度的权重
-    
-    def forward(self, embeddings, raw_ids, scores):
-        """
-        Args:
-            embeddings: (batch_size, embedding_dim) - L2归一化的embedding
-            raw_ids: (batch_size,) - 对应的原始图像ID
-            scores: (batch_size,) - 质量或一致性分数
-        """
-        batch_size = embeddings.size(0)
-        device = embeddings.device
-        
-        # 相似度矩阵
-        sim_matrix = torch.matmul(embeddings, embeddings.t()) / self.temperature
-        
-        # RAW ID正样本mask
-        raw_ids = raw_ids.unsqueeze(1)
-        positive_mask = (raw_ids == raw_ids.t()).float()
-        self_mask = torch.eye(batch_size, device=device).bool()
-        positive_mask = positive_mask.masked_fill(self_mask, 0)
-        
-        # 分数相似度权重
-        score_i = scores.unsqueeze(1)
-        score_j = scores.unsqueeze(0)
-        score_diff = torch.abs(score_i - score_j)
-        score_sim = torch.exp(-score_diff ** 2 / 2.0)  # 高斯核
-        
-        # 结合RAW ID和分数相似度
-        # 正样本：必须是同一RAW ID，权重由分数相似度调整
-        weighted_positive_mask = positive_mask * (1.0 + self.score_weight * score_sim)
-        
-        # 负样本：不同RAW ID
-        negative_mask = (raw_ids != raw_ids.t()).float()
-        
-        # InfoNCE loss
-        sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
-        
-        pos_sim = (sim_matrix_exp * weighted_positive_mask).sum(dim=1)
-        all_sim = (sim_matrix_exp * (weighted_positive_mask + negative_mask)).sum(dim=1)
-        
-        has_positive = (positive_mask.sum(dim=1) > 0)
-        
-        if has_positive.sum() > 0:
-            loss = -torch.log(pos_sim[has_positive] / (all_sim[has_positive] + 1e-8))
-            return loss.mean()
-        else:
-            return torch.tensor(0.0, device=device)
-
-
-class MultiTaskLoss(nn.Module):
-    """
-    多任务损失函数
-    L_total = λ_mse * (L_mse_quality + L_mse_identity) 
-              + λ_rank * (L_rank_quality + L_rank_identity)
-              + λ_contrast * L_contrastive
-    """
-    def __init__(self, lambda_mse=0.3, lambda_rank=1.0, lambda_contrast=0.5, 
-                 contrastive_type='raw_id'):
-        """
-        Args:
-            lambda_mse: MSE loss权重
-            lambda_rank: Ranking loss权重
-            lambda_contrast: Contrastive loss权重
-            contrastive_type: 对比学习类型
-                - 'raw_id': 基于RAW ID的标准InfoNCE (推荐)
-                - 'hybrid': 混合RAW ID和分数相似度
-        """
-        super(MultiTaskLoss, self).__init__()
-        self.mse_loss = nn.MSELoss()
-        self.ranking_loss = RankingLoss(margin=0.5)
-        
-        # 选择对比学习损失类型
-        if contrastive_type == 'raw_id':
-            self.contrastive_loss = RawIDContrastiveLoss(temperature=0.07)
-        elif contrastive_type == 'hybrid':
-            self.contrastive_loss = HybridContrastiveLoss(temperature=0.07, score_weight=0.3)
-        else:
-            raise ValueError(f"Unknown contrastive_type: {contrastive_type}")
-        
-        self.contrastive_type = contrastive_type
-        self.lambda_mse = lambda_mse
-        self.lambda_rank = lambda_rank
-        self.lambda_contrast = lambda_contrast
-    
-    def forward(self, quality_pred, identity_pred, quality_target, identity_target, 
-                embeddings, raw_ids):
-        """
-        Args:
-            quality_pred: 质量预测 (batch_size,)
-            identity_pred: 一致性预测 (batch_size,)
-            quality_target: 质量真实值 (batch_size,)
-            identity_target: 一致性真实值 (batch_size,)
-            embeddings: embedding向量 (batch_size, embedding_dim)
-            raw_ids: 原始图像ID (batch_size,)
-        """
-        # MSE损失
-        loss_mse_quality = self.mse_loss(quality_pred, quality_target)
-        loss_mse_identity = self.mse_loss(identity_pred, identity_target)
-        
-        # Ranking损失
-        loss_rank_quality = self.ranking_loss(quality_pred, quality_target)
-        loss_rank_identity = self.ranking_loss(identity_pred, identity_target)
-        
-        # 对比学习损失（基于RAW ID）
-        if self.contrastive_type == 'raw_id':
-            loss_contrast = self.contrastive_loss(embeddings, raw_ids)
-        elif self.contrastive_type == 'hybrid':
-            # 使用一致性分数作为软权重
-            loss_contrast = self.contrastive_loss(embeddings, raw_ids, identity_target)
-        
-        # 总损失
-        total_loss = (self.lambda_mse * (loss_mse_quality + loss_mse_identity) + 
-                     self.lambda_rank * (loss_rank_quality + loss_rank_identity) +
-                     self.lambda_contrast * loss_contrast)
-        
-        # 返回总损失和各项损失（用于监控）
+        # 方便 log：返回一个 dict
         loss_dict = {
-            'total': total_loss,
-            'mse_quality': loss_mse_quality,
-            'mse_identity': loss_mse_identity,
-            'rank_quality': loss_rank_quality,
-            'rank_identity': loss_rank_identity,
-            'contrastive': loss_contrast
+            'total': loss_total,
+            'reg': loss_reg,
+            'q_reg': loss_q,
+            'id_reg': loss_id,
+            'plcc': loss_plcc,
+            'plcc_q': loss_plcc_q,
+            'plcc_id': loss_plcc_id,
+            'supcon': loss_sup,
+            'rank_id': loss_rank_id
         }
         
-        return total_loss, loss_dict
-
-
-def get_loss_function(loss_type='multitask', lambda_mse=0.3, lambda_rank=1.0, 
-                     lambda_contrast=0.5, contrastive_type='raw_id'):
-    """获取损失函数"""
-    if loss_type == 'mse':
-        return nn.MSELoss()
-    elif loss_type == 'multitask':
-        return MultiTaskLoss(
-            lambda_mse=lambda_mse, 
-            lambda_rank=lambda_rank, 
-            lambda_contrast=lambda_contrast,
-            contrastive_type=contrastive_type
-        )
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
+        return loss_dict
+    
+    # ---------- 工具函数们 ----------
+    @staticmethod
+    def plcc_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """batch 内 Pearson 相关系数的损失: L = 1 - ρ"""
+        x = pred
+        y = target
+        x = x - x.mean()
+        y = y - y.mean()
+        vx = x.pow(2).mean()
+        vy = y.pow(2).mean()
+        corr = (x * y).mean() / (vx.sqrt() * vy.sqrt() + eps)
+        return 1.0 - corr
+    
+    def supcon_loss(self, feats: torch.Tensor, raw_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Supervised Contrastive Loss：同一个 raw_id 作为正样本，不同 raw_id 作为负样本。
+        """
+        device = feats.device
+        B = feats.size(0)
+        
+        # 归一化特征
+        feats = F.normalize(feats, dim=1)
+        
+        # 构造 [B, B] 的相似度矩阵
+        sim_matrix = torch.matmul(feats, feats.t())  # cosine sim 因为已 normalize
+        
+        # 构造 mask: 同 raw_id 且 i!=j 为正样本
+        raw_ids = raw_ids.view(-1, 1)
+        mask = torch.eq(raw_ids, raw_ids.t()).float().to(device)
+        # 去掉对角线（与自己不算正样本）
+        mask = mask - torch.eye(B, device=device)
+        
+        # logits / temperature
+        logits = sim_matrix / self.cfg.supcon_temperature
+        
+        # 对每个 i，计算：
+        # -log( sum_{p in P(i)} exp(sim(i,p)/T) / sum_{k!=i} exp(sim(i,k)/T) )
+        # denominator: sum over all k != i
+        # 先构造一个 mask 去掉自己
+        logits_mask = 1 - torch.eye(B, device=device)
+        exp_logits = torch.exp(logits) * logits_mask  # [B, B]
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # 只对正样本位置求平均
+        # 对每个 i，正样本数量为 mask[i].sum()
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        
+        # 整个 batch 平均
+        loss = -mean_log_prob_pos.mean()
+        return loss
+    
+    def id_ranking_loss(self,
+                       id_pred: torch.Tensor,
+                       id_gt: torch.Tensor,
+                       raw_ids: torch.Tensor) -> torch.Tensor:
+        """
+        同一个 raw_id 内做 margin ranking：
+        如果 id_gt_i > id_gt_j，期望 id_pred_i > id_pred_j + margin
+        """
+        device = id_pred.device
+        margin = self.cfg.rank_margin
+        
+        total_loss = 0.0
+        count = 0
+        
+        # 遍历每一个 raw_id
+        unique_raw_ids = raw_ids.unique()
+        for rid in unique_raw_ids:
+            idx = (raw_ids == rid).nonzero(as_tuple=True)[0]
+            if idx.numel() < 2:
+                continue  # 只有一张没法排
+            
+            # 当前 raw 的 gt & pred
+            gt = id_gt[idx]
+            pred = id_pred[idx]
+            
+            # 构造所有 pair (i, j) 使得 gt_i > gt_j
+            # 简单做法：两层循环，数据量不大（每个 raw 8 张）
+            for i in range(len(idx)):
+                for j in range(len(idx)):
+                    if gt[i] > gt[j] + 1e-6:  # 避免相等
+                        # 希望 pred[i] >= pred[j] + margin
+                        diff = pred[i] - pred[j]
+                        loss_ij = F.relu(margin - diff)
+                        total_loss += loss_ij
+                        count += 1
+        
+        if count == 0:
+            return torch.tensor(0.0, device=device)
+        
+        return total_loss / count

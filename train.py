@@ -12,7 +12,7 @@ from config import Config
 from data.dataset import MultiTaskDataset, get_transforms
 from data.preprocess import load_data, split_data
 from models.vit_regressor import ReferenceGuidedViT
-from models.losses import MultiTaskLoss
+from models.losses import IQALoss, LossConfig
 from utils.metrics import evaluate_all_metrics, print_metrics
 
 
@@ -20,11 +20,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, accumulatio
     model.train()
     total_loss = 0.0
     loss_components = {
-        "mse_quality": 0.0,
-        "mse_identity": 0.0,
-        "rank_quality": 0.0,
-        "rank_identity": 0.0,
-        "contrastive": 0.0,
+        "reg": 0.0,
+        "q_reg": 0.0,
+        "id_reg": 0.0,
+        "plcc": 0.0,
+        "plcc_q": 0.0,
+        "plcc_id": 0.0,
+        "supcon": 0.0,
+        "rank_id": 0.0,
     }
 
     optimizer.zero_grad()
@@ -42,7 +45,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, accumulatio
             gen_images, raw_images, return_embedding=True
         )
 
-        loss, loss_dict = criterion(
+        loss_dict = criterion(
             quality_pred,
             identity_pred,
             quality_scores,
@@ -50,6 +53,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, accumulatio
             embeddings,
             raw_ids,
         )
+        
+        loss = loss_dict['total']
         
         # 梯度累积：模拟更大的batch size
         loss = loss / accumulation_steps
@@ -95,7 +100,7 @@ def validate(model, dataloader, criterion, device):
                 gen_images, raw_images, return_embedding=True
             )
 
-            loss, _ = criterion(
+            loss_dict = criterion(
                 quality_pred,
                 identity_pred,
                 quality_scores,
@@ -104,7 +109,7 @@ def validate(model, dataloader, criterion, device):
                 raw_ids,
             )
 
-            total_loss += loss.item()
+            total_loss += loss_dict['total'].item()
             all_quality_pred.extend(quality_pred.cpu().numpy())
             all_quality_target.extend(quality_scores.cpu().numpy())
             all_identity_pred.extend(identity_pred.cpu().numpy())
@@ -214,12 +219,16 @@ def main():
     print(f"  总参数: {total_params:,}")
     print(f"  可训练参数: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
 
-    criterion = MultiTaskLoss(
-        lambda_mse=cfg.LAMBDA_MSE,
+    loss_config = LossConfig(
+        w_q=cfg.W_Q,
+        w_id=cfg.W_ID,
+        lambda_plcc=cfg.LAMBDA_PLCC,
+        lambda_sup=cfg.LAMBDA_SUP,
         lambda_rank=cfg.LAMBDA_RANK,
-        lambda_contrast=cfg.LAMBDA_CONTRAST,
-        contrastive_type=cfg.CONTRASTIVE_TYPE
+        supcon_temperature=cfg.SUPCON_TEMPERATURE,
+        rank_margin=cfg.RANK_MARGIN
     )
+    criterion = IQALoss(config=loss_config)
 
     # 优化器：只优化需要梯度的参数
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -242,8 +251,11 @@ def main():
     scheduler = LambdaLR(optimizer, lr_lambda=warmup_cosine_schedule)
 
     print(f"\n开始训练 (共 {cfg.NUM_EPOCHS} 个epoch)...")
-    print(f"损失权重: λ_mse={cfg.LAMBDA_MSE}, λ_rank={cfg.LAMBDA_RANK}, λ_contrast={cfg.LAMBDA_CONTRAST}")
-    print(f"对比学习类型: {cfg.CONTRASTIVE_TYPE}")
+    print(f"损失权重:")
+    print(f"  回归: w_q={cfg.W_Q}, w_id={cfg.W_ID}")
+    print(f"  PLCC: λ_plcc={cfg.LAMBDA_PLCC}")
+    print(f"  SupCon: λ_sup={cfg.LAMBDA_SUP}, T={cfg.SUPCON_TEMPERATURE}")
+    print(f"  Ranking: λ_rank={cfg.LAMBDA_RANK}, margin={cfg.RANK_MARGIN}")
 
     best_avg_plcc = -1.0
     best_epoch = 0
@@ -265,11 +277,14 @@ def main():
         )
 
         print(f"\n训练损失: {train_loss:.4f}")
-        print(f"  MSE (质量): {loss_components['mse_quality']:.4f}")
-        print(f"  MSE (一致性): {loss_components['mse_identity']:.4f}")
-        print(f"  Ranking (质量): {loss_components['rank_quality']:.4f}")
-        print(f"  Ranking (一致性): {loss_components['rank_identity']:.4f}")
-        print(f"  Contrastive: {loss_components['contrastive']:.4f}")
+        print(f"  回归损失: {loss_components['reg']:.4f}")
+        print(f"    质量: {loss_components['q_reg']:.4f}")
+        print(f"    ID一致性: {loss_components['id_reg']:.4f}")
+        print(f"  PLCC损失: {loss_components['plcc']:.4f}")
+        print(f"    质量PLCC: {loss_components['plcc_q']:.4f}")
+        print(f"    ID PLCC: {loss_components['plcc_id']:.4f}")
+        print(f"  SupCon损失: {loss_components['supcon']:.4f}")
+        print(f"  ID Ranking损失: {loss_components['rank_id']:.4f}")
 
         val_loss, quality_metrics, identity_metrics = validate(
             model, val_loader, criterion, device

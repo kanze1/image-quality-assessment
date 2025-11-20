@@ -26,7 +26,7 @@ def evaluate(model, dataloader, device):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="评估"):
-            gen_images, raw_images, quality_scores, identity_scores = batch
+            gen_images, raw_images, quality_scores, identity_scores, raw_ids = batch
             gen_images = gen_images.to(device)
             raw_images = raw_images.to(device)
 
