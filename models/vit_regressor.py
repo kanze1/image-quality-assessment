@@ -33,8 +33,14 @@ class ReferenceGuidedViT(nn.Module):
         super().__init__()
         
         # 共享backbone
+        # 处理 hf-hub: 前缀
+        if model_name.startswith('hf-hub:'):
+            actual_model_name = model_name.replace('hf-hub:', '')
+        else:
+            actual_model_name = model_name
+            
         self.backbone = timm.create_model(
-            model_name,
+            actual_model_name,
             pretrained=pretrained,
             num_classes=0,
         )
@@ -153,8 +159,14 @@ class SingleBranchViT(nn.Module):
     ):
         super().__init__()
         
+        # 处理 hf-hub: 前缀
+        if model_name.startswith('hf-hub:'):
+            actual_model_name = model_name.replace('hf-hub:', '')
+        else:
+            actual_model_name = model_name
+            
         self.backbone = timm.create_model(
-            model_name,
+            actual_model_name,
             pretrained=pretrained,
             num_classes=0,
         )

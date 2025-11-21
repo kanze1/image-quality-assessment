@@ -11,10 +11,10 @@ class Config:
     SCORE_FILE = os.path.join(DATA_ROOT, "BT-Scores.xlsx")
     
     # 模型配置
-    MODEL_NAME = "vit_small_patch16_224"  # 改用ViT Small（22M参数，更适合小数据集）
+    MODEL_NAME = "hf-hub:timm/vit_base_patch16_224.augreg2_in21k_ft_in1k"
     PRETRAINED = True  # ✓ 使用ImageNet预训练权重（关键！）
     FACE_PRETRAINED_PATH = None  # 人脸预训练权重路径（可选）
-    FREEZE_BACKBONE = True  # 冻结backbone，只训练任务头（小数据集关键策略）
+    FREEZE_BACKBONE = False  # 冻结backbone，只训练任务头（小数据集关键策略）
     
     NUM_CLASSES = 1  # 回归任务
     IMG_SIZE = 224
